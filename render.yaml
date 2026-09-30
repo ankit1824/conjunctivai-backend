@@ -1,9 +1,10 @@
 services:
   - type: web
-    name: conjunctivai-api
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    name: conjunctivai-backend
+    runtime: python
+    pythonVersion: "3.11.9"
+    buildCommand: "pip install --only-binary=:all: -r requirements.txt || pip install -r requirements.txt"
+    startCommand: "uvicorn api:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11.9"
