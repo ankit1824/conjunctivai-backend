@@ -127,19 +127,47 @@ async def lifespan(app: FastAPI):
     # Startup: load all models
     for key in MODEL_META:
         p = MODELS_DIR / f"{key}.joblib"
-        if p.exists():
-            LOADED_MODELS[key] = joblib.load(p)
-            print(f"✓ Loaded {key}")
-        else:
-            print(f"✗ WARNING: {key}.joblib not found")
+        try:
+            if p.exists():
+                LOADED_MODELS[key] = joblib.load(p)
+                print(f"✓ Loaded {key}")
+            else:
+                print(f"✗ WARNING: {key}.joblib not found at {p}")
+        except Exception as e:
+            print(f"✗ ERROR loading {key}: {e}")
     yield
     # Shutdown: nothing to clean up
     LOADED_MODELS.clear()
 
 app = FastAPI(title="ConjunctivAI", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_origin_regex=".*",
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
+)
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+# Explicit OPTIONS handler for CORS preflight (belt-and-suspenders)
+from fastapi import Request
+from fastapi.responses import Response
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str, request: Request):
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
 @app.get("/health")
 def health():
     return {"status": "ok", "models_loaded": list(LOADED_MODELS.keys())}
