@@ -1,9 +1,10 @@
 """
-ConjunctivAI — FastAPI backend (memory-optimised for Render Free)
+ConjunctivAI — FastAPI backend
 Start: uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
 import io, json, time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
@@ -31,74 +32,57 @@ FEAT_NAMES = (
 )
 
 MODEL_META = {
-    "xgboost": {"name": "XGBoost",      "family": "Gradient Boosting", "color": "#F6C90E"},
-    "rf":      {"name": "Random Forest","family": "Bagged Trees",      "color": "#FF6B6B"},
-    "svm":     {"name": "SVM (RBF)",    "family": "Margin-based",      "color": "#4EA8DE"},
-    "knn":     {"name": "KNN",          "family": "Instance-based",    "color": "#56CFB2"},
-    "gnb":     {"name": "Gaussian NB",  "family": "Probabilistic",     "color": "#C77DFF"},
+    "xgboost": {"name": "XGBoost",       "family": "Gradient Boosting", "color": "#F6C90E"},
+    "rf":      {"name": "Random Forest", "family": "Bagged Trees",      "color": "#FF6B6B"},
+    "svm":     {"name": "SVM (RBF)",     "family": "Margin-based",      "color": "#4EA8DE"},
+    "knn":     {"name": "KNN",           "family": "Instance-based",    "color": "#56CFB2"},
+    "gnb":     {"name": "Gaussian NB",   "family": "Probabilistic",     "color": "#C77DFF"},
 }
 
-# ── Pure-numpy GLCM (replaces scikit-image) ───────────────────────────────────
+# ── Pure-numpy GLCM ───────────────────────────────────────────────────────────
 def _glcm_props(gray_q: np.ndarray, levels: int = 64):
-    """Compute GLCM features without scikit-image."""
     h, w = gray_q.shape
     glcm = np.zeros((levels, levels), dtype=np.float64)
-    # horizontal co-occurrence
     i_idx = gray_q[:, :-1].ravel().astype(int)
     j_idx = gray_q[:, 1:].ravel().astype(int)
     np.add.at(glcm, (i_idx, j_idx), 1)
-    # vertical co-occurrence
     i_idx = gray_q[:-1, :].ravel().astype(int)
     j_idx = gray_q[1:, :].ravel().astype(int)
     np.add.at(glcm, (i_idx, j_idx), 1)
-    # symmetrise + normalise
     glcm += glcm.T
     total = glcm.sum()
     if total > 0:
         glcm /= total
-
     ix = np.arange(levels)
-    iy = np.arange(levels)
-    II, JJ = np.meshgrid(ix, iy, indexing='ij')
+    II, JJ = np.meshgrid(ix, ix, indexing='ij')
     diff2 = (II - JJ) ** 2
-
     contrast    = float((glcm * diff2).sum())
     homogeneity = float((glcm / (1 + diff2)).sum())
     energy      = float((glcm ** 2).sum())
-
     mu_i = (glcm * II).sum()
     mu_j = (glcm * JJ).sum()
-    sig_i = np.sqrt(((glcm * (II - mu_i) ** 2)).sum())
-    sig_j = np.sqrt(((glcm * (JJ - mu_j) ** 2)).sum())
-    if sig_i * sig_j > 1e-10:
-        correlation = float(((glcm * (II - mu_i) * (JJ - mu_j)).sum()) / (sig_i * sig_j))
-    else:
-        correlation = 0.0
-
+    sig_i = np.sqrt((glcm * (II - mu_i) ** 2).sum())
+    sig_j = np.sqrt((glcm * (JJ - mu_j) ** 2).sum())
+    correlation = float(((glcm * (II - mu_i) * (JJ - mu_j)).sum()) / (sig_i * sig_j + 1e-10))
     return contrast, homogeneity, energy, correlation
 
-
-# ── Pure-numpy LBP (replaces scikit-image) ───────────────────────────────────
+# ── Vectorised LBP (no Python loops over pixels) ─────────────────────────────
 def _lbp_uniform(gray: np.ndarray) -> np.ndarray:
-    """8-point radius-1 uniform LBP without scikit-image."""
-    h, w = gray.shape
+    """8-point radius-1 uniform LBP — fully vectorised with numpy."""
     pad = np.pad(gray.astype(np.int32), 1, mode='edge')
+    h, w = gray.shape
     offsets = [(-1,-1),(-1,0),(-1,1),(0,1),(1,1),(1,0),(1,-1),(0,-1)]
     code = np.zeros((h, w), dtype=np.uint8)
+    center = gray.astype(np.int32)
     for bit, (dy, dx) in enumerate(offsets):
         nbr = pad[1+dy:h+1+dy, 1+dx:w+1+dx]
-        code |= ((nbr >= gray.astype(np.int32)) << bit).astype(np.uint8)
-    # count transitions to determine uniformity
-    lbp_out = np.zeros((h, w), dtype=np.int32)
-    for i in range(h):
-        for j in range(w):
-            c = int(code[i, j])
-            # number of 0→1 or 1→0 transitions in circular bit string
-            bits = [(c >> b) & 1 for b in range(8)]
-            trans = sum(bits[b] != bits[(b+1) % 8] for b in range(8))
-            lbp_out[i, j] = c if trans <= 2 else 9  # 9 = non-uniform bin
-    return lbp_out
-
+        code |= ((nbr >= center) << bit).astype(np.uint8)
+    # Count bit transitions vectorised
+    bits = np.stack([(code >> b) & 1 for b in range(8)], axis=0).astype(np.uint8)  # (8,h,w)
+    shifted = np.roll(bits, -1, axis=0)
+    transitions = (bits != shifted).sum(axis=0)  # (h,w)
+    uniform = np.where(transitions <= 2, code.astype(np.int32), 9)
+    return uniform
 
 # ── Feature extraction ────────────────────────────────────────────────────────
 def extract_features(img_bytes: bytes) -> np.ndarray:
@@ -135,34 +119,35 @@ def extract_features(img_bytes: bytes) -> np.ndarray:
 
     return np.array(feat, dtype=np.float32)
 
-
-# ── App setup ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="ConjunctivAI", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
+# ── App + lifespan (replaces deprecated @app.on_event) ───────────────────────
 LOADED_MODELS: dict = {}
 
-@app.on_event("startup")
-def load_models():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: load all models
     for key in MODEL_META:
         p = MODELS_DIR / f"{key}.joblib"
         if p.exists():
             LOADED_MODELS[key] = joblib.load(p)
-            print(f"Loaded {key}")
+            print(f"✓ Loaded {key}")
         else:
-            print(f"WARNING: {key}.joblib not found")
+            print(f"✗ WARNING: {key}.joblib not found")
+    yield
+    # Shutdown: nothing to clean up
+    LOADED_MODELS.clear()
 
+app = FastAPI(title="ConjunctivAI", version="1.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok", "models_loaded": list(LOADED_MODELS.keys())}
 
-
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     if not LOADED_MODELS:
-        raise HTTPException(503, "Models not loaded.")
+        raise HTTPException(503, "Models not loaded yet — please retry in a few seconds.")
     img_bytes = await file.read()
     t0   = time.time()
     feat = extract_features(img_bytes)
@@ -181,9 +166,9 @@ async def predict(file: UploadFile = File(...)):
 
         fi = None
         if hasattr(model, "feature_importances_"):
-            imp    = model.feature_importances_
-            top5   = np.argsort(imp)[-5:][::-1]
-            fi     = [{"feature": FEAT_NAMES[i], "importance": round(float(imp[i]), 4)} for i in top5]
+            imp  = model.feature_importances_
+            top5 = np.argsort(imp)[-5:][::-1]
+            fi   = [{"feature": FEAT_NAMES[i], "importance": round(float(imp[i]), 4)} for i in top5]
 
         results.append({
             "key": key, "name": meta["name"], "family": meta["family"],
@@ -203,7 +188,6 @@ async def predict(file: UploadFile = File(...)):
         "models": results,
     }
 
-
 @app.get("/metrics")
 def get_metrics():
     p = ARTIFACT_DIR / "metrics.json"
@@ -211,14 +195,12 @@ def get_metrics():
         raise HTTPException(404, "metrics.json not found.")
     return JSONResponse(json.loads(p.read_text()))
 
-
 @app.get("/roc_data")
 def get_roc_data():
     p = ARTIFACT_DIR / "roc_data.json"
     if not p.exists():
         raise HTTPException(404, "roc_data.json not found.")
     return JSONResponse(json.loads(p.read_text()))
-
 
 @app.get("/artifacts/{filename}")
 def serve_artifact(filename: str):
