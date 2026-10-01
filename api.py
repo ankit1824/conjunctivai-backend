@@ -36,7 +36,7 @@ MODEL_META = {
     "rf":      {"name": "Random Forest", "family": "Bagged Trees",      "color": "#FF6B6B"},
     "svm":     {"name": "SVM (RBF)",     "family": "Margin-based",      "color": "#4EA8DE"},
     "knn":     {"name": "KNN",           "family": "Instance-based",    "color": "#56CFB2"},
-    "gnb":     {"name": "Gaussian NB",   "family": "Probabilistic",     "color": "#C77DFF"},
+    "gnb":     {"name": "Logistic Reg",  "family": "Probabilistic",     "color": "#C77DFF"},
 }
 
 # ── Pure-numpy GLCM ───────────────────────────────────────────────────────────
